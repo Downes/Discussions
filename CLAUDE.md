@@ -51,6 +51,5 @@ The CList client re-POSTs every 60 seconds to keep a discussion alive.
 ]
 ```
 
-## Still To Do
-- Update `dynamicp2p.js` API_URL to point to discussions.mooc.ca
-- Update setup-notes.md
+## CList client
+`dynamicp2p.js` points to `https://discussions.mooc.ca/api/discussions` — already wired up.
