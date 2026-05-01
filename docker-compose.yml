@@ -1,0 +1,16 @@
+services:
+  discussions:
+    build: .
+    container_name: discussions
+    restart: unless-stopped
+    environment:
+      - KVSTORE_URL=http://kvstore:5000
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data
+    networks:
+      - web
+
+networks:
+  web:
+    external: true
