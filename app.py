@@ -11,18 +11,77 @@ All endpoints require a valid kvstore Bearer token (validated via /auth/verify).
 import os
 import json
 import time
+import sqlite3
 import requests
 from functools import wraps
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
+
+from admin_settings import SettingField, init_settings_table, get_setting, register_admin_settings_routes
 
 app = Flask(__name__)
 
-KVSTORE_URL  = os.environ.get('KVSTORE_URL', 'http://kvstore:5000')
-DISCUSSIONS_FILE = os.path.join(os.environ.get('DATA_DIR', '/data'), 'discussions.json')
+DATA_DIR = os.environ.get('DATA_DIR', '/data')
+SETTINGS_DB_PATH = os.path.join(DATA_DIR, 'settings.db')
+DISCUSSIONS_FILE = os.path.join(DATA_DIR, 'discussions.json')
 DISCUSSION_EXPIRY = 300   # seconds — discussion expires if no heartbeat received
 CACHE_TTL = 300           # seconds — how long a verified token stays trusted
 MAX_DISCUSSIONS_TOTAL = 100   # hard cap on total active discussions
 MAX_DISCUSSIONS_PER_USER = 5  # per-user cap to prevent flooding
+
+SETTINGS_SCHEMA = [
+    SettingField(
+        key="ENABLED", label="Enabled", type="boolean", sensitive=False, validate=None,
+        help="When off, this app's functional endpoints return 503. /admin/settings "
+             "and /health stay reachable so you can turn it back on.",
+    ),
+    SettingField(
+        key="KVSTORE_URL", label="KVStore URL", type="url", sensitive=False, validate=None,
+        help="kvstore instance used to verify every request's Bearer token "
+             "(GET {KVSTORE_URL}/auth/verify). Only change this if discussions "
+             "should authenticate against a different kvstore server.",
+    ),
+]
+SETTINGS_DEFAULTS = {
+    "ENABLED": "true",
+    "KVSTORE_URL": os.environ.get('KVSTORE_URL', 'http://kvstore:5000'),
+}
+
+
+def get_settings_db():
+    if 'settings_db' not in g:
+        g.settings_db = sqlite3.connect(SETTINGS_DB_PATH)
+        g.settings_db.row_factory = sqlite3.Row
+    return g.settings_db
+
+
+@app.teardown_appcontext
+def close_settings_db(e=None):
+    db = g.pop('settings_db', None)
+    if db:
+        db.close()
+
+
+def init_settings_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    db = sqlite3.connect(SETTINGS_DB_PATH)
+    init_settings_table(db)
+    db.close()
+
+
+init_settings_db()
+
+
+def _kvstore_url():
+    return get_setting(get_settings_db(), "KVSTORE_URL", default=SETTINGS_DEFAULTS["KVSTORE_URL"])
+
+
+@app.before_request
+def _enabled_gate():
+    if request.path in ('/admin/settings', '/health'):
+        return None
+    if get_setting(get_settings_db(), "ENABLED", default="true") == "false":
+        return jsonify({"error": "Service temporarily disabled by administrator"}), 503
+
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -39,7 +98,7 @@ def _verify_token(token: str) -> str | None:
             return username
     try:
         resp = requests.get(
-            f'{KVSTORE_URL}/auth/verify',
+            f'{_kvstore_url()}/auth/verify',
             headers={'Authorization': f'Bearer {token}'},
             timeout=5,
         )
@@ -68,6 +127,19 @@ def token_required(f):
             return jsonify({'error': 'Unauthorized'}), 401
         return f(username, *args, **kwargs)
     return wrapper
+
+
+def verify_token_for_admin():
+    """(username, None) on success, (None, (body, status)) on failure —
+    the shape register_admin_settings_routes expects."""
+    auth = request.headers.get('Authorization', '')
+    parts = auth.split()
+    if len(parts) != 2 or parts[0].lower() != 'bearer':
+        return None, ({'error': 'Authorization header required'}, 401)
+    username = _verify_token(parts[1])
+    if not username:
+        return None, ({'error': 'Unauthorized'}, 401)
+    return username, None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,6 +233,9 @@ def public_discussions():
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'}), 200
+
+
+register_admin_settings_routes(app, SETTINGS_SCHEMA, get_settings_db, verify_token_for_admin, SETTINGS_DEFAULTS)
 
 
 if __name__ == '__main__':

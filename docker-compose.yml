@@ -11,6 +11,7 @@ services:
     environment:
       - KVSTORE_URL=http://kvstore:5000
       - DATA_DIR=/data
+      - ADMIN_USERNAMES=downes
     volumes:
       - ./data:/data
     networks:
