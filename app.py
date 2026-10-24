@@ -5,20 +5,25 @@ Users advertise an active discussion (name + PeerJS peer ID) so others
 can find and join it. Actual chat messages travel peer-to-peer via WebRTC;
 this server only stores the ephemeral peer IDs.
 
-All endpoints require a valid kvstore Bearer token (validated via /auth/verify).
+All endpoints require a valid kvstore Bearer token, verified locally via
+JWT/JWKS ("Pattern B") against the issuer named in the token's own `iss`
+claim — open to any kvstore instance, no allowlist. Pre-migration opaque
+tokens fall back to KVSTORE_URL/auth/verify.
 """
 
 import os
 import json
 import time
 import sqlite3
-import requests
 from functools import wraps
 from flask import Flask, request, jsonify, g
 
-from admin_settings import SettingField, init_settings_table, get_setting, register_admin_settings_routes
+from clist_server_admin.sqlite import SettingField, init_settings_table, get_setting, register_admin_settings_routes
+from clist_kvstore_auth.sync import verify_token as _kv_verify_token, owns as _kv_owns
 
 app = Flask(__name__)
+
+ADMIN_USERNAMES = {u.strip() for u in os.environ.get("ADMIN_USERNAMES", "").split(",") if u.strip()}
 
 DATA_DIR = os.environ.get('DATA_DIR', '/data')
 SETTINGS_DB_PATH = os.path.join(DATA_DIR, 'settings.db')
@@ -36,14 +41,16 @@ SETTINGS_SCHEMA = [
     ),
     SettingField(
         key="KVSTORE_URL", label="KVStore URL", type="url", sensitive=False, validate=None,
-        help="kvstore instance used to verify every request's Bearer token "
-             "(GET {KVSTORE_URL}/auth/verify). Only change this if discussions "
-             "should authenticate against a different kvstore server.",
+        help="This app's own kvstore instance — used as the fallback target "
+             "for pre-migration opaque tokens (GET {KVSTORE_URL}/auth/verify) "
+             "and as the sole trusted issuer for ADMIN_USERNAMES admin "
+             "access. Does NOT gate ordinary token verification, which is "
+             "local JWT/JWKS and open to any issuer's JWT.",
     ),
 ]
 SETTINGS_DEFAULTS = {
     "ENABLED": "true",
-    "KVSTORE_URL": os.environ.get('KVSTORE_URL', 'http://kvstore:5000'),
+    "KVSTORE_URL": os.environ.get('KVSTORE_URL', 'https://kvstore.mooc.ca'),
 }
 
 
@@ -85,61 +92,67 @@ def _enabled_gate():
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
-_token_username_cache: dict[str, tuple[float, str]] = {}  # token → (expiry, username)
+# Only opaque/legacy tokens are cached — real JWTs are verified fresh every
+# time, since local JWKS verification is already fast (PyJWKClient caches
+# the JWKS itself per-issuer) and caching the result here would let an
+# expired JWT keep working past its own `exp` claim for up to CACHE_TTL.
+_token_identity_cache: dict[str, tuple[float, object]] = {}  # token → (expiry, Identity)
 
 
-def _verify_token(token: str) -> str | None:
-    """Return the username if the token is valid, None otherwise.
-    Valid results are cached for CACHE_TTL seconds."""
+def _is_jwt(token: str) -> bool:
+    return token.count('.') == 2
+
+
+def _verify_token(auth: str):
+    """Return (Identity, None) on success, (None, (body, status)) on failure."""
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    if not token:
+        return None, ({'error': 'Authorization header required'}, 401)
+    if _is_jwt(token):
+        return _kv_verify_token(auth, _kvstore_url())
     now = time.time()
-    if token in _token_username_cache:
-        expiry, username = _token_username_cache[token]
+    cached = _token_identity_cache.get(token)
+    if cached:
+        expiry, identity = cached
         if expiry > now:
-            return username
-    try:
-        resp = requests.get(
-            f'{_kvstore_url()}/auth/verify',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=5,
-        )
-    except requests.RequestException:
-        return None
-    if resp.status_code == 200:
-        username = resp.json().get('username') or ''
-        if username:
-            _token_username_cache[token] = (now + CACHE_TTL, username)
-            return username
-    _token_username_cache.pop(token, None)
-    return None
+            return identity, None
+    identity, err = _kv_verify_token(auth, _kvstore_url())
+    if err:
+        _token_identity_cache.pop(token, None)
+        return None, err
+    _token_identity_cache[token] = (now + CACHE_TTL, identity)
+    return identity, None
 
 
 def token_required(f):
     """Decorator: reject requests without a valid kvstore Bearer token.
-    Injects the verified username as the first positional argument."""
+    Injects the verified Identity as the first positional argument."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        auth = request.headers.get('Authorization', '')
-        parts = auth.split()
-        if len(parts) != 2 or parts[0].lower() != 'bearer':
-            return jsonify({'error': 'Authorization header required'}), 401
-        username = _verify_token(parts[1])
-        if not username:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return f(username, *args, **kwargs)
+        identity, err = _verify_token(request.headers.get('Authorization', ''))
+        if err:
+            body, status = err
+            return jsonify(body), status
+        return f(identity, *args, **kwargs)
     return wrapper
+
+
+def is_admin(identity) -> bool:
+    # Reimplemented locally (not clist_kvstore_auth.sync.is_admin) because
+    # the trusted admin issuer is this app's own KVSTORE_URL setting, which
+    # is DB-overridable via /admin/settings, not just a static env var.
+    return bool(identity) and identity.username in ADMIN_USERNAMES and identity.iss == _kvstore_url()
 
 
 def verify_token_for_admin():
     """(username, None) on success, (None, (body, status)) on failure —
     the shape register_admin_settings_routes expects."""
-    auth = request.headers.get('Authorization', '')
-    parts = auth.split()
-    if len(parts) != 2 or parts[0].lower() != 'bearer':
-        return None, ({'error': 'Authorization header required'}, 401)
-    username = _verify_token(parts[1])
-    if not username:
-        return None, ({'error': 'Unauthorized'}, 401)
-    return username, None
+    identity, err = _verify_token(request.headers.get('Authorization', ''))
+    if err:
+        return None, err
+    if not is_admin(identity):
+        return None, ({'error': 'Forbidden'}, 403)
+    return identity.username, None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -169,7 +182,7 @@ def _prune(discussions: list) -> list:
 
 @app.route('/api/discussions', methods=['GET', 'POST', 'DELETE'])
 @token_required
-def manage_discussions(username):
+def manage_discussions(identity):
     if request.method == 'GET':
         # Return all active (non-expired) discussions.
         discussions = _prune(_load())
@@ -195,10 +208,11 @@ def manage_discussions(username):
         # New discussion — enforce caps before appending.
         if len(discussions) >= MAX_DISCUSSIONS_TOTAL:
             return jsonify({'error': 'Server discussion limit reached'}), 503
-        user_count = sum(1 for d in discussions if d.get('owner') == username)
+        kvstore_url = _kvstore_url()
+        user_count = sum(1 for d in discussions if _kv_owns(d.get('owner', ''), identity, kvstore_url))
         if user_count >= MAX_DISCUSSIONS_PER_USER:
             return jsonify({'error': 'Per-user discussion limit reached'}), 429
-        discussions.append({'name': name, 'peerId': peer_id, 'owner': username,
+        discussions.append({'name': name, 'peerId': peer_id, 'owner': identity.qualified_id,
                              'public': is_public, 'timestamp': int(time.time())})
         _save(discussions)
         return jsonify({'message': 'Discussion advertised successfully'}), 201
@@ -214,7 +228,7 @@ def manage_discussions(username):
         target = next((d for d in discussions if d['name'] == name), None)
         if target is None:
             return jsonify({'error': 'Discussion not found'}), 404
-        if target.get('owner') and target['owner'] != username:
+        if target.get('owner') and not _kv_owns(target['owner'], identity, _kvstore_url()):
             return jsonify({'error': 'Forbidden'}), 403
         updated = [d for d in discussions if d['name'] != name]
         _save(updated)
